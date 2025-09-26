@@ -567,7 +567,7 @@ if __name__ == "__main__":
     # 可视化匹配点
     visualize_matched_points(left_rectified, right_rectified, pts_left, pts_right)
 
-    # 保存匹配点结果（与后续三维重建对接的标准格式）
+    # 保存匹配点结果
     print("保存匹配点结果...")
     np.savetxt('matched_points_left.txt', pts_left, fmt='%.2f')
     np.savetxt('matched_points_right.txt', pts_right, fmt='%.2f')
