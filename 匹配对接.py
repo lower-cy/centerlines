@@ -140,7 +140,7 @@ def stereo_rectify(left_img, right_img):
     R1, R2, P1, P2, Q, validPixROI1, validPixROI2 = cv2.stereoRectify(
         CAMERA_MATRIX_LEFT, DIST_COEFF_LEFT,
         CAMERA_MATRIX_RIGHT, DIST_COEFF_RIGHT,
-        (w, h), R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9
+        (w, h), R, T, alpha=-1,flags=0|cv2.CALIB_USE_INTRINSIC_GUESS
     )
     
     # 计算矫正映射
@@ -155,7 +155,7 @@ def stereo_rectify(left_img, right_img):
     left_rectified = cv2.remap(left_img, left_map1, left_map2, cv2.INTER_LINEAR)
     right_rectified = cv2.remap(right_img, right_map1, right_map2, cv2.INTER_LINEAR)
     
-    return left_rectified, right_rectified, Q
+    return left_rectified, right_rectified,P1, P2, Q
 
 # ====================== 图像预处理函数 ======================
 
@@ -423,6 +423,64 @@ def compute_disparity_sgbm(left_img, right_img, config):
     
     return disparity
 
+
+def sift_disparity(left_img, right_img,offset):
+    # # 转换为灰度图
+    # gray_left = cv2.cvtColor(left_img, cv2.COLOR_BGR2GRAY)
+    # gray_right = cv2.cvtColor(right_img, cv2.COLOR_BGR2GRAY)
+
+    # 计算SIFT特征检测和匹配的时间
+    start = cv2.getTickCount()
+    # 创建SIFT对象
+    sift = cv2.SIFT_create()
+
+    # 检测关键点和计算描述子
+    keypoints1, descriptors1 = sift.detectAndCompute(left_img, None)
+    keypoints2, descriptors2 = sift.detectAndCompute(right_img, None)
+
+    # 创建FLANN匹配器
+    flann = cv2.FlannBasedMatcher()
+
+    # 进行特征匹配
+    matches = flann.knnMatch(descriptors1, descriptors2, k=2)
+
+    # 筛选匹配结果
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good_matches.append(m)
+
+    end = cv2.getTickCount()
+    print('SIFT匹配时间:', (end - start) / cv2.getTickFrequency(), 's')
+    # 提取匹配点坐标
+    pts_left = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
+    pts_right = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
+    
+    # 计算视差（右图x坐标 - 左图x坐标）
+    # disparities = pts_left[:, 0] - pts_right[:, 0] +63.977317810058594
+    disparities = pts_left[:, 0] - pts_right[:, 0] - offset
+    # print(disparities)
+    # 创建稀疏视差图
+    h, w = left_img.shape
+    sparse_disp = np.zeros((h, w), dtype=np.float32)
+    for (x, y), d in zip(pts_left.astype(int), disparities):
+        if 0 <= x < w and 0 <= y < h:
+            sparse_disp[y, x] = d
+    
+    # 使用Inpaint进行空洞填充（简单示例）
+    mask = (sparse_disp == 0).astype(np.uint8)
+    dense_disp = cv2.inpaint(sparse_disp, mask, 3, cv2.INPAINT_TELEA)
+
+    # 绘制匹配结果
+    result = cv2.drawMatches(left_img, keypoints1,right_img, keypoints2, good_matches, None)
+
+    # 保存结果
+    cv2.imwrite('SIFT_Matches.jpg', result)
+
+    
+    return sparse_disp, dense_disp
+
+
 def extract_matched_points(disparity, left_lines, right_img_shape):
     """
     从视差图中提取匹配点
@@ -458,6 +516,31 @@ def extract_matched_points(disparity, left_lines, right_img_shape):
     
     return np.float32(pts_left), np.float32(pts_right)
 
+
+import numpy as np
+
+def generate_disparity_map_from_matches(pts_left, pts_right, img_shape):
+    """
+    根据匹配点生成视差图
+    Args:
+        pts_left: 左图匹配点坐标，shape=(N, 2)，float32或int
+        pts_right: 右图匹配点坐标，shape=(N, 2)，float32或int
+        img_shape: 图像尺寸 (H, W)
+    Returns:
+        disparity_map: 视差图，shape=(H, W)，无匹配点处为-1
+    """
+    H, W = img_shape[:2]
+    disparity_map = np.full((H, W), -1, dtype=np.float32)  # 初始化为-1表示无效
+    
+    for (xL, yL), (xR, yR) in zip(pts_left, pts_right):
+        xL_int, yL_int = int(round(xL)), int(round(yL))
+        disp = xL - xR  # 视差
+        
+        if 0 <= xL_int < W and 0 <= yL_int < H:
+            disparity_map[yL_int, xL_int] = disp
+    
+    return disparity_map
+
 # ====================== 可视化函数 ======================
 
 def visualize_results(img, lines, title):
@@ -487,6 +570,71 @@ def visualize_results(img, lines, title):
     plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
     plt.title(f'Detected {len(lines)} Laser Lines')
     plt.show()
+
+
+from scipy.interpolate import interp1d
+
+def resample_line(pts, num_points):
+    # 按y坐标排序
+    pts = pts[np.argsort(pts[:, 1])]
+    y = pts[:, 1]
+    x = pts[:, 0]
+    f = interp1d(y, x, kind='linear', fill_value='extrapolate')
+    y_new = np.linspace(y.min(), y.max(), num_points)
+    x_new = f(y_new)
+    return np.stack([x_new, y_new], axis=1)
+
+def compute_disparity_with_resample(lineL, lineR):
+    disparities = []
+    for ptsL, ptsR in zip(lineL, lineR):
+        num_points = max(ptsL.shape[0], ptsR.shape[0])
+        ptsL_resampled = resample_line(ptsL, num_points)
+        ptsR_resampled = resample_line(ptsR, num_points)
+        disp = ptsL_resampled[:, 0] - ptsR_resampled[:, 0]
+        disparities.append(disp)
+    return disparities
+
+
+def disparity_lines_to_map(img_shape, lineL, disparities):
+    H, W = img_shape[:2]
+    print(f"H:{H},W:{W}")
+    disp_map = np.full((H, W), -1, dtype=np.float32)  # -1表示无效视差
+    
+    for pts, disp in zip(lineL, disparities):
+        pts_int = pts.astype(int)
+        for (x, y), d in zip(pts_int, disp):
+            if 0 <= x < W and 0 <= y < H:
+                disp_map[y, x] = d
+    
+    return disp_map
+
+
+
+
+def line_results(img, lines):
+    """可视化检测结果"""
+    # fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+
+    # ax[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    # ax[0].set_title(f'{title} Original')
+
+    # preprocessed = multi_scale_preprocess(img, LEFT_CONFIG if 'L' in title else RIGHT_CONFIG)
+    # ax[1].imshow(preprocessed, cmap='gray')
+    # ax[1].set_title('Preprocessed')
+    
+    vis = img.copy()
+    try:
+        cmap = plt.colormaps['tab10']
+    except AttributeError:
+        cmap = plt.cm.get_cmap('tab10')
+    
+    for i, line in enumerate(lines):
+        color_rgba = cmap(i % 10)
+        color = tuple(int(c * 255) for c in color_rgba[:3])
+        pts = line.astype(int)
+        cv2.polylines(vis, [pts], False, color, 2)
+    return vis
+
 
 def visualize_disparity(disparity):
     """可视化视差图"""
@@ -532,40 +680,121 @@ if __name__ == "__main__":
 
     print(f"图像尺寸 - 左图: {left_img.shape}, 右图: {right_img.shape}")
 
-    # 检测激光线（在原始图像上）
-    print("\n处理左图...")
-    left_lines = detect_laser_lines(left_img, LEFT_CONFIG)
-    print(f"左图提取到 {len(left_lines)} 条激光线")
 
-    print("\n处理右图...")
-    right_lines = detect_laser_lines(right_img, RIGHT_CONFIG)
-    print(f"右图提取到 {len(right_lines)} 条激光线")
 
-    # 可视化原始检测结果
-    visualize_results(left_img, left_lines, 'Left Image')
-    visualize_results(right_img, right_lines, 'Right Image')
+
 
     # 极线矫正
     print("进行极线矫正...")
-    left_rectified, right_rectified, Q = stereo_rectify(left_img, right_img)
+    left_rectified, right_rectified,P1 ,P2, Q = stereo_rectify(left_img, right_img)
     print(f"重投影矩阵 Q: \n{Q}")
 
-    # 转换为灰度图用于SGBM
-    left_gray = cv2.cvtColor(left_rectified, cv2.COLOR_BGR2GRAY)
-    right_gray = cv2.cvtColor(right_rectified, cv2.COLOR_BGR2GRAY)
+    # visualize_disparity(left_rectified)
+        # 检测激光线（在原始图像上）
+    print("\n处理左图...")
+    left_lines = detect_laser_lines(left_rectified, LEFT_CONFIG)
+    print(f"左图提取到 {len(left_lines)} 条激光线")
 
+    print("\n处理右图...")
+    right_lines = detect_laser_lines(right_rectified, RIGHT_CONFIG)
+    print(f"右图提取到 {len(right_lines)} 条激光线")
+
+    # # 可视化原始检测结果
+    # visualize_results(left_rectified, left_lines, 'Left Image')
+    # visualize_results(right_rectified, right_lines, 'Right Image')
+
+
+
+    # imgL_rectified= left_rectified
+    # imgR_rectified =right_rectified
+    # imgL_rectified.astype(np.float32)
+    # imgR_rectified.astype(np.float32)
+    # # 在校正后图像上绘制水平参考线
+    # h, w = imgL_rectified.shape[:2]
+    # for y in range(0, h, 50):
+    #     cv2.line(imgL_rectified, (0, y), (w, y), (255,0,0), 2)
+    #     cv2.line(imgR_rectified, (0, y), (w, y), (255,0,0), 2)
+    # combined = np.hstack((imgL_rectified, imgR_rectified))
+    # cv2.imwrite('rectified_check.jpg', combined)
+
+
+
+
+
+
+    vis = np.zeros(left_rectified.shape[:2], np.uint8)
+    line_L=line_results(left_rectified,left_lines)
+    line_R=line_results(right_rectified,right_lines)
+    cv2.imwrite("img_line/left_line.bmp",line_L)
+    cv2.imwrite("img_line/right_line.bmp",line_R)
+
+    line_dis=compute_disparity_with_resample(left_lines, right_lines)
+    simple_disp=disparity_lines_to_map(left_rectified.shape,left_lines,line_dis)
+
+    # 转换为灰度图用于SGBM
+    left_gray = cv2.cvtColor(line_L, cv2.COLOR_BGR2GRAY)
+    right_gray = cv2.cvtColor(line_R, cv2.COLOR_BGR2GRAY)
     # 计算视差图
     print("计算视差图...")
-    disparity = compute_disparity_sgbm(left_gray, right_gray, SGBM_CONFIG)
-    visualize_disparity(disparity)
+    sbgm_disp = compute_disparity_sgbm(line_L, line_R, SGBM_CONFIG)
+
+
+
+    # delta_cx=P1[0][2]-P2[0][2]
+    # sparse_disp, dense_disp = sift_disparity(line_L, line_R,delta_cx)
+
+
+
+
 
     # 提取匹配点
     print("提取匹配点...")
-    pts_left, pts_right = extract_matched_points(disparity, left_lines, right_gray.shape)
+    pts_left, pts_right = extract_matched_points(sbgm_disp, left_lines, right_gray.shape)
     print(f"提取到 {len(pts_left)} 对匹配点")
 
+    remap_disp=generate_disparity_map_from_matches(pts_left, pts_right,left_rectified.shape)
+
+
+    disparity=remap_disp
+    visualize_disparity(disparity)
     # 可视化匹配点
-    visualize_matched_points(left_rectified, right_rectified, pts_left, pts_right)
+    # visualize_matched_points(left_rectified, right_rectified, pts_left, pts_right)
+
+
+
+    colorR_rectified = line_L
+    # 生成三维点云
+    print(f"Gererating point clouds")
+    points_3D = cv2.reprojectImageTo3D(disparity, Q)
+
+    # 创建点云颜色映射（使用右图颜色）
+    colors =cv2.cvtColor(colorR_rectified,cv2.COLOR_BGR2RGB)
+
+    # 设定最小视差阈值（视差小于此值的点视为太远）
+    min_disp = 0  # 根据场景调整，值越小，保留的深度越远
+    mask = disparity > min_disp
+    out_points = points_3D[mask]
+    out_colors = colors[mask]
+
+    # 保存为PLY文件
+    def write_ply(filename, verts, colors):
+        with open(filename, 'w') as f:
+            header = '''ply
+    format ascii 1.0
+    element vertex {}
+    property float x
+    property float y
+    property float z
+    property uchar red
+    property uchar green
+    property uchar blue
+    end_header
+    '''.format(len(verts))
+            f.write(header)
+            for (x, y, z), (r, g, b) in zip(verts, colors):
+                f.write('{} {} {} {} {} {}\n'.format(x, y, z, r, g, b))
+
+    write_ply('output.ply', out_points, out_colors)
 
     # 保存匹配点结果
     print("保存匹配点结果...")
@@ -579,11 +808,11 @@ if __name__ == "__main__":
     print(f"右图匹配点坐标形状: {pts_right.shape}")
     print(f"重投影矩阵 Q: \n{Q}")
     print("\n后续三维重建代码可以使用以下数据:")
-    print("1. 左图匹配点坐标: pts_left (N, 2)")
-    print("2. 右图匹配点坐标: pts_right (N, 2)") 
-    print("3. 重投影矩阵 Q: 用于将视差转换为3D坐标")
-    print("\n三维重建示例代码:")
-    print("points_3D = cv2.reprojectImageTo3D(disparity, Q)")
-    print("# 或者使用:")
-    print("points = cv2.triangulatePoints(P1, P2, pts_left.T, pts_right.T)")
-    print("points /= points[3]  # 齐次坐标归一化")
+    # print("1. 左图匹配点坐标: pts_left (N, 2)")
+    # print("2. 右图匹配点坐标: pts_right (N, 2)") 
+    # print("3. 重投影矩阵 Q: 用于将视差转换为3D坐标")
+    # print("\n三维重建示例代码:")
+    # print("points_3D = cv2.reprojectImageTo3D(disparity, Q)")
+    # print("# 或者使用:")
+    # print("points = cv2.triangulatePoints(P1, P2, pts_left.T, pts_right.T)")
+    # print("points /= points[3]  # 齐次坐标归一化")
