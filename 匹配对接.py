@@ -587,7 +587,7 @@ def compute_disparity_with_resample(lineL, lineR):
         num_points = max(ptsL.shape[0], ptsR.shape[0])
         ptsL_resampled = resample_line(ptsL, num_points)
         ptsR_resampled = resample_line(ptsR, num_points)
-        disp = ptsL_resampled[:, 0] - ptsR_resampled[:, 0]
+        disp = ptsL_resampled[:, 0] - ptsR_resampled[:, 0]+P2[0][2]-P1[0][2]
         disparities.append(disp)
     return disparities
 
@@ -787,6 +787,7 @@ if __name__ == "__main__":
     print(f"右图提取到 {len(right_lines)} 条激光线")
 
     # # 可视化原始检测结果
+    # cv2.imwrite(left_rectified)
     # visualize_results(left_rectified, left_lines, 'Left Image')
     # visualize_results(right_rectified, right_lines, 'Right Image')
 
@@ -892,6 +893,7 @@ if __name__ == "__main__":
     # 设定最小视差阈值（视差小于此值的点视为太远）
     min_disp = -10  # 根据场景调整，值越小，保留的深度越远
     mask = disparity > min_disp
+    print(disparity)
     out_points = points_3D[mask]
     out_colors = colors[mask]
 
