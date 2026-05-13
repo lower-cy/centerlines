@@ -166,6 +166,7 @@ def main():
         pts = sample_plane_on_bbox(A, B, C, D, bbox, n1=20, n2=20)
         if len(pts) == 0:
             continue
+        
 
         color = cmap(i % 10)
         # 用散点图代替曲面图，避免非矩形网格导致绘图失败
