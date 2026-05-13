@@ -124,7 +124,7 @@ SGBM_CONFIG = {
 
 def stereo_rectify(left_img, right_img):
     """
-    双目极线矫正（畸变问题难以解决）
+    双目极线矫正
     Args:
         left_img: 左图
         right_img: 右图
@@ -516,9 +516,6 @@ def extract_matched_points(disparity, left_lines, right_img_shape):
     
     return np.float32(pts_left), np.float32(pts_right)
 
-
-import numpy as np
-
 def generate_disparity_map_from_matches(pts_left, pts_right, img_shape):
     """
     根据匹配点生成视差图
@@ -594,18 +591,86 @@ def compute_disparity_with_resample(lineL, lineR):
         disparities.append(disp)
     return disparities
 
+def compute_disparity_with_resample_OneLine(lineL, lineR, target_idx , target_idr, y_tolerance=1.0):
+    """
+    根据指定序号，计算左右图中对应单条线段的视差
 
-def disparity_lines_to_map(img_shape, lineL, disparities):
+    参数：
+        lineL: 左图所有线段的列表（列表元素为(N,2)的numpy数组）
+        lineR: 右图所有线段的列表（列表元素为(N,2)的numpy数组）
+        target_idx: 左图要计算的线段序号（整数，如0、1、5）
+        target_idr: 右图要计算的线段序号（整数，如0、1、5）
+        y_tolerance: y坐标匹配容差（默认1.0），右线段中y值在[current_y - tolerance, current_y + tolerance]范围内的点视为匹配
+
+    返回：
+        disp: 指定线段的视差值数组（numpy.ndarray）
+    """
+    disparities = []
+    # # 1. 合法性校验：防止索引越界或线段数量不匹配
+    # if len(lineL) != len(lineR):
+    #     raise ValueError(f"左图线段数({len(lineL)})与右图线段数({len(lineR)})不匹配！")
+    if target_idx < 0 or target_idx >= len(lineL):
+        raise IndexError(f"序号{target_idx}超出范围！有效序号：0~{len(lineL)-1}")
+
+    # 2. 提取指定序号的左右线段
+    ptsL = lineL[target_idx].copy()  # 显式copy，隔离原数据
+    ptsR = lineR[target_idr].copy()  # 显式copy，隔离原数据
+
+    # 保留浮点精度，提取x/y坐标
+    yL = ptsL[:, 1]
+    xL = ptsL[:, 0]
+    yR = ptsR[:, 1]
+    xR = ptsR[:, 0]
+
+    # 3. 遍历左线段的每个点，在右线段中按y容差匹配
+    matched_ys = []
+    matched_xL = []
+    matched_xR = []
+
+    for idx_L in range(len(yL)):
+        current_y = yL[idx_L]
+        current_x = xL[idx_L]
+
+        # 找右线段中y值在容差范围内的点（浮点匹配）
+        match_mask = np.abs(yR - current_y) <= y_tolerance
+        match_R_indices = np.where(match_mask)[0]
+
+        # 只保留第一个匹配的点（避免多对一）
+        if len(match_R_indices) > 0:
+            matched_ys.append(current_y)
+            matched_xL.append(current_x)
+            matched_xR.append(xR[match_R_indices[0]])
+
+    # 4. 转换为数组（保留浮点类型）
+    matched_ys = np.array(matched_ys)
+    matched_xL = np.array(matched_xL)
+    matched_xR = np.array(matched_xR)
+
+    # 5. 按y坐标升序排列（保持线段顺序）
+    if len(matched_ys) > 0:
+        sort_idx = np.argsort(matched_ys)
+        matched_ys = matched_ys[sort_idx]
+        matched_xL = matched_xL[sort_idx]
+        matched_xR = matched_xR[sort_idx]
+
+    # 6. 计算视差
+    disp = matched_xL - matched_xR
+    # disparities.append(disp)
+    return disp
+
+
+def disparity_lines_to_map(img_shape, left_lines, disparities, maped_num):
     H, W = img_shape[:2]
     print(f"H:{H},W:{W}")
-    disp_map = np.full((H, W), -1, dtype=np.float32)  # -1表示无效视差
-    
-    for pts, disp in zip(lineL, disparities):
+    disp_map = np.full((H, W), -11, dtype=np.float32)
+
+    for (idxL, _), disp in zip(maped_num, disparities):
+        pts = left_lines[idxL]
         pts_int = pts.astype(int)
         for (x, y), d in zip(pts_int, disp):
             if 0 <= x < W and 0 <= y < H:
                 disp_map[y, x] = d
-    
+
     return disp_map
 
 
@@ -633,6 +698,28 @@ def line_results(img, lines):
         color = tuple(int(c * 255) for c in color_rgba[:3])
         pts = line.astype(int)
         cv2.polylines(vis, [pts], False, color, 2)
+
+                # 4. 获取线段头部（起点）坐标（pts的第一个点）
+        head_x, head_y = pts[0][0], pts[0][1]
+        
+        # 5. 绘制序号标注
+        # 设置标注样式：字体、大小、颜色、粗细
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.8  # 字体大小
+        font_thickness = 2  # 字体粗细
+        text = str(i)  # 线段在列表中的序号
+        
+        # 计算文本尺寸（用于调整位置，避免超出图像）
+        text_size, _ = cv2.getTextSize(text, font, font_scale, font_thickness)
+        text_w, text_h = text_size
+        
+        # 调整文本位置：在起点左上方，避免遮挡线段
+        text_x = max(0, head_x - text_w // 2)
+        text_y = max(text_h, head_y - 10)
+        
+        # 绘制文本（先画黑色背景增加对比度，再画白色文字）
+        cv2.putText(vis, text, (text_x, text_y), font, font_scale, (0, 0, 0), font_thickness + 1)
+        cv2.putText(vis, text, (text_x, text_y), font, font_scale, (255, 255, 255), font_thickness)
     return vis
 
 
@@ -717,35 +804,67 @@ if __name__ == "__main__":
     # combined = np.hstack((imgL_rectified, imgR_rectified))
     # cv2.imwrite('rectified_check.jpg', combined)
 
-
-
-
-
-
     vis = np.zeros(left_rectified.shape[:2], np.uint8)
     line_L=line_results(left_rectified,left_lines)
     line_R=line_results(right_rectified,right_lines)
     cv2.imwrite("img_line/left_line.bmp",line_L)
     cv2.imwrite("img_line/right_line.bmp",line_R)
 
-    line_dis=compute_disparity_with_resample(left_lines, right_lines)
-    simple_disp=disparity_lines_to_map(left_rectified.shape,left_lines,line_dis)
+    # N,2大小array，存储左右得出线段的对应关系
+    maped_num = np.array([
+        [1,8],   # (x1, y1)
+        [0,0],   # (x2, y2)
+        [2,1],
+        # [3,2],
+        # [4,3],
+        # [5,4],
+        # [6,5],
+        # [7,6],
+        # [8,7],
+        # [9,9],
+        # [10,10],
+        # [11,11],
+        # [12,12],
+        # [13,13],
+        # [14,15],
+        # [15,14],
+        # [16,16],
+        # [17,17],
+        # [18,18],
+        # [19,19],
+        # [21,4],
+        # [20,5],
+        # [22,22],
+        # [23,24],
+        # [24,23],
+        # [7,20],
+        # [8,21],
+        # [28,15],
+    ])
+    # 简单线段匹配
+    # line_dis=compute_disparity_with_resample(left_lines, right_lines)
+    # 像元尺寸
+    pixel_size_mm = 0.00345  # 3.45 µm
+    delta_cx=P2[0][2]-P1[0][2] #cx2 -cx1 存在主点差的视差计算公式：xl-cx1-(xr-cx2)
+    # 主点差的物理距离
+    cx1_cx2_mm = delta_cx * pixel_size_mm
+    print(f"主点差物理距离: {cx1_cx2_mm:.2f} mm")
+    
+    line_dis=[]
+    for pt in maped_num:
+        line_dis.append(compute_disparity_with_resample_OneLine(left_lines, right_lines,pt[0],pt[1]))
+    
+    simple_disp=disparity_lines_to_map(left_rectified.shape,left_lines,line_dis,maped_num)
 
     # 转换为灰度图用于SGBM
     left_gray = cv2.cvtColor(line_L, cv2.COLOR_BGR2GRAY)
     right_gray = cv2.cvtColor(line_R, cv2.COLOR_BGR2GRAY)
     # 计算视差图
     print("计算视差图...")
+
     sbgm_disp = compute_disparity_sgbm(line_L, line_R, SGBM_CONFIG)
 
-
-
-    # delta_cx=P1[0][2]-P2[0][2]
     # sparse_disp, dense_disp = sift_disparity(line_L, line_R,delta_cx)
-
-
-
-
 
     # 提取匹配点
     print("提取匹配点...")
@@ -755,9 +874,9 @@ if __name__ == "__main__":
     remap_disp=generate_disparity_map_from_matches(pts_left, pts_right,left_rectified.shape)
 
 
-    disparity=remap_disp
-    visualize_disparity(disparity)
-    # 可视化匹配点
+    disparity=simple_disp
+    # visualize_disparity(disparity)
+    # # 可视化匹配点
     # visualize_matched_points(left_rectified, right_rectified, pts_left, pts_right)
 
 
@@ -771,7 +890,7 @@ if __name__ == "__main__":
     colors =cv2.cvtColor(colorR_rectified,cv2.COLOR_BGR2RGB)
 
     # 设定最小视差阈值（视差小于此值的点视为太远）
-    min_disp = 0  # 根据场景调整，值越小，保留的深度越远
+    min_disp = -10  # 根据场景调整，值越小，保留的深度越远
     mask = disparity > min_disp
     out_points = points_3D[mask]
     out_colors = colors[mask]
